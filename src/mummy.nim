@@ -165,6 +165,7 @@ type
       requestCounter: int # Incoming request incs, outgoing response decs
       streamChannel: StreamChannel    # Non-nil when streaming upload is active
       streamingRequest: bool          # True while streaming body is being received
+      streamChunked: bool             # True if streaming request uses chunked encoding
       streamBytesRemaining: int       # For Content-Length streaming: bytes left
 
   IncomingRequestState = object
@@ -1009,14 +1010,14 @@ proc popRequest(
     result.body.setLen(dataEntry.requestState.contentLength)
   dataEntry.requestState = IncomingRequestState()
   inc dataEntry.requestCounter
-  if dataEntry.bytesReceived > 0:
+  if dataEntry.bytesReceived > 0 and not dataEntry.streamingRequest:
     server.log(DebugLevel, "Receive buffer not empty after request")
 
 proc afterRecvHttp(
   server: Server,
   clientSocket: SocketHandle,
   dataEntry: DataEntry
-): bool {.raises: [].} =
+): bool {.raises: [IOSelectorsException].} =
   # We do not expect pipelined requests so log if any new data is received
   # while a request is outstanding (except when streaming body data)
   if dataEntry.requestCounter > 0 and
@@ -1028,8 +1029,10 @@ proc afterRecvHttp(
     )
     dataEntry.requestState.loggedUnexpectedData = true
 
-  # Have we completed parsing the headers?
-  if not dataEntry.requestState.headersParsed:
+  # If we're already streaming body data, skip header parsing
+  if dataEntry.streamingRequest:
+    discard # Fall through to streaming body handling below
+  elif not dataEntry.requestState.headersParsed:
     # Not done with headers yet, look for the end of the headers
     let headersEnd = dataEntry.recvBuf.find(
       "\r\n\r\n",
@@ -1220,6 +1223,7 @@ proc afterRecvHttp(
       let channel = initStreamChannel()
       dataEntry.streamChannel = channel
       dataEntry.streamingRequest = true
+      dataEntry.streamChunked = dataEntry.requestState.chunked
       dataEntry.streamBytesRemaining =
         dataEntry.requestState.contentLength
 
@@ -1245,7 +1249,7 @@ proc afterRecvHttp(
   # If this is a streaming request, push body data to the channel
   if dataEntry.streamingRequest:
     let channel = dataEntry.streamChannel
-    if dataEntry.requestState.chunked:
+    if dataEntry.streamChunked:
       # Streaming chunked: decode chunks and push decoded data to channel
       while true:
         if dataEntry.bytesReceived < 3:
@@ -1308,10 +1312,13 @@ proc afterRecvHttp(
             signal(channel.cond)
 
         if written < chunkLen:
-          # Channel is full, pause reading
-          # We can't partially consume a chunk, so we need the full chunk
-          # to fit. Mark as paused and wait.
-          channel.pausedReading = true
+          # Channel is full, pause reading from this socket
+          withLock channel.lock:
+            channel.pausedReading = true
+          let events =
+            if dataEntry.outgoingBuffers.len > 0: {Write}
+            else: {} # No events - paused
+          server.selector.updateHandle2(clientSocket, events)
           return false
 
         # Remove this chunk from the receive buffer
@@ -1326,20 +1333,24 @@ proc afterRecvHttp(
         dataEntry.bytesReceived = bytesRemaining
     else:
       # Streaming Content-Length: push raw bytes to channel
-      if dataEntry.bytesReceived > 0:
-        # Don't push more than the remaining content length
+      while dataEntry.bytesReceived > 0 and
+          dataEntry.streamBytesRemaining > 0:
         let toWrite = min(dataEntry.bytesReceived,
                           dataEntry.streamBytesRemaining)
         var written: int
-        if toWrite > 0:
-          withLock channel.lock:
-            written = channel.writeChannel(
-              dataEntry.recvBuf[0].addr,
-              toWrite
-            )
-            if written > 0:
-              signal(channel.cond)
-              dataEntry.streamBytesRemaining -= written
+        var paused = false
+        withLock channel.lock:
+          written = channel.writeChannel(
+            dataEntry.recvBuf[0].addr,
+            toWrite
+          )
+          if written > 0:
+            signal(channel.cond)
+            dataEntry.streamBytesRemaining -= written
+          if written == 0 or channel.freeSpace == 0:
+            # Mark paused inside the lock so the worker thread sees it
+            channel.pausedReading = true
+            paused = true
 
         if written > 0:
           if written < dataEntry.bytesReceived:
@@ -1350,17 +1361,21 @@ proc afterRecvHttp(
             )
           dataEntry.bytesReceived -= written
 
-        if toWrite > 0 and written == 0:
-          # Channel is full, pause reading
-          channel.pausedReading = true
+        if paused:
+          # Remove Read from selector to stop receiving
+          let events =
+            if dataEntry.outgoingBuffers.len > 0: {Write}
+            else: {} # No events - paused
+          server.selector.updateHandle2(clientSocket, events)
+          return false
 
-        if dataEntry.streamBytesRemaining <= 0:
-          # All body bytes have been delivered
-          withLock channel.lock:
-            channel.closeChannel()
-            signal(channel.cond)
-          dataEntry.streamingRequest = false
-          dataEntry.streamChannel = nil
+      if dataEntry.streamBytesRemaining <= 0:
+        # All body bytes have been delivered
+        withLock channel.lock:
+          channel.closeChannel()
+          signal(channel.cond)
+        dataEntry.streamingRequest = false
+        dataEntry.streamChannel = nil
       return false
   elif dataEntry.requestState.chunked: # Chunked request (non-streaming)
     # Process as many chunks as we have
@@ -1673,13 +1688,14 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
       for clientSocket in socketsToResume:
         if clientSocket in server.selector:
           let dataEntry = server.selector.getData(clientSocket)
-          if dataEntry.streamChannel != nil and
-              dataEntry.streamChannel.pausedReading:
-            dataEntry.streamChannel.pausedReading = false
+          if dataEntry.streamChannel != nil:
             let events =
               if dataEntry.outgoingBuffers.len > 0: {Read, Write}
               else: {Read}
             server.selector.updateHandle2(clientSocket, events)
+            # Process any buffered data that was received before pausing
+            if dataEntry.bytesReceived > 0:
+              receivedFrom.add(clientSocket)
 
     if shutdownTriggered:
       server.destroy(true)
@@ -1755,9 +1771,14 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
             continue
 
         if Write in readyKey.events:
-          let
-            outgoingBuffer = dataEntry.outgoingBuffers.peekFirst()
-            bytesSent =
+          let outgoingBuffer = dataEntry.outgoingBuffers.peekFirst()
+          let totalBytes =
+            outgoingBuffer.buffer1.len + outgoingBuffer.buffer2.len
+          if totalBytes == 0:
+            # Empty buffer (e.g. HTTP/1.0 streaming finish), process directly
+            sentTo.add(readyKey.fd.SocketHandle)
+          else:
+            let bytesSent =
               if outgoingBuffer.bytesSent < outgoingBuffer.buffer1.len:
                 readyKey.fd.SocketHandle.send(
                   outgoingBuffer.buffer1[outgoingBuffer.bytesSent].addr,
@@ -1772,12 +1793,12 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
                   (outgoingBuffer.buffer2.len - buffer2Pos).cint,
                   when defined(MSG_NOSIGNAL): MSG_NOSIGNAL else: 0
                 )
-          if bytesSent > 0:
-            outgoingBuffer.bytesSent += bytesSent
-            sentTo.add(readyKey.fd.SocketHandle)
-          else:
-            needClosing.incl(readyKey.fd.SocketHandle)
-            continue
+            if bytesSent > 0:
+              outgoingBuffer.bytesSent += bytesSent
+              sentTo.add(readyKey.fd.SocketHandle)
+            else:
+              needClosing.incl(readyKey.fd.SocketHandle)
+              continue
 
     for clientSocket in receivedFrom:
       if clientSocket in needClosing:
