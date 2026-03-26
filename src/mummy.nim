@@ -38,6 +38,34 @@ let
   http11 = "HTTP/1.1"
 
 type
+  ResponseStreamObj = object
+    server: Server
+    clientSocket: SocketHandle
+    clientId: uint64
+    closeConnection: bool
+    httpVersion: HttpVersion
+    http10Mode: bool           # HTTP/1.0: no chunk framing, Connection: close
+    lock: Lock
+    cond: Cond
+    pendingBytes: Atomic[int]
+    maxPendingBytes: int
+    finished: bool
+    error: Atomic[bool]
+
+  ResponseStream* = ptr ResponseStreamObj
+    ## A handle for streaming response data in chunks.
+
+  RequestStreamObj = object
+    server: Server
+    clientSocket: SocketHandle
+    clientId: uint64
+    channel: StreamChannel
+    contentLength: int         # -1 if chunked (unknown total)
+    bytesRead: int
+
+  RequestStream* = ptr RequestStreamObj
+    ## A handle for reading streaming request body data.
+
   RequestObj* = object
     httpVersion*: HttpVersion ## HTTP version from the request line.
     httpMethod*: string ## HTTP method from the request line.
@@ -52,6 +80,8 @@ type
     clientSocket: SocketHandle
     clientId: uint64
     responded: bool
+    requestStream*: RequestStream ## Non-nil when body is being streamed.
+    responseStream*: ResponseStream ## Set by startResponse, used for cleanup.
 
   Request* = ptr RequestObj
 
@@ -101,6 +131,10 @@ type
     websocketClaimed: Table[WebSocket, bool]
     websocketQueues: Table[WebSocket, Deque[WebSocketUpdate]]
     websocketQueuesLock: Lock
+    streamingThreshold: int
+    streamResumeReading: SelectEvent
+    streamResumeQueue: Deque[SocketHandle]
+    streamResumeQueueLock: Lock
 
   Server* = ptr ServerObj
 
@@ -129,6 +163,9 @@ type
       upgradedToWebSocket, closeFrameSent: bool
       sendsWaitingForUpgrade: seq[OutgoingBuffer]
       requestCounter: int # Incoming request incs, outgoing response decs
+      streamChannel: StreamChannel    # Non-nil when streaming upload is active
+      streamingRequest: bool          # True while streaming body is being received
+      streamBytesRemaining: int       # For Content-Length streaming: bytes left
 
   IncomingRequestState = object
     headersParsed: bool
@@ -154,6 +191,7 @@ type
     closeConnection, isWebSocketUpgrade, isCloseFrame: bool
     buffer1, buffer2: string
     bytesSent: int
+    responseStream: ResponseStream # Non-nil for streaming response buffers
 
   WebSocketUpdate = object
     event: WebSocketEvent
@@ -391,6 +429,208 @@ proc respond*(
   if queueWasEmpty:
     request.server.trigger(request.server.responseQueued)
 
+proc startResponse*(
+  request: Request,
+  statusCode: int,
+  headers: sink HttpHeaders = emptyHttpHeaders(),
+  maxPendingBytes = 256 * 1024
+): ResponseStream {.raises: [], gcsafe.} =
+  ## Begins a streaming response with chunked transfer encoding.
+  ## Returns a ResponseStream that the handler uses to send body chunks.
+  ## The handler MUST call finish() on the returned stream.
+
+  let stream = cast[ResponseStream](allocShared0(sizeof(ResponseStreamObj)))
+  stream.server = request.server
+  stream.clientSocket = request.clientSocket
+  stream.clientId = request.clientId
+  stream.httpVersion = request.httpVersion
+  stream.maxPendingBytes = maxPendingBytes
+  initLock(stream.lock)
+  initCond(stream.cond)
+
+  stream.closeConnection =
+    request.httpVersion == Http10
+
+  if request.headers.headerContainsToken("Connection", "close"):
+    stream.closeConnection = true
+  elif request.headers.headerContainsToken("Connection", "keep-alive"):
+    stream.closeConnection = false
+
+  if not stream.closeConnection:
+    stream.closeConnection = headers.headerContainsToken("Connection", "close")
+
+  if request.httpVersion == Http10:
+    # HTTP/1.0 does not support chunked transfer encoding
+    # Omit Content-Length, use Connection: close
+    stream.http10Mode = true
+    stream.closeConnection = true
+    headers["Connection"] = "close"
+  else:
+    headers["Transfer-Encoding"] = "chunked"
+    if stream.closeConnection:
+      headers["Connection"] = "close"
+
+  var encodedResponse = OutgoingBuffer()
+  encodedResponse.clientSocket = request.clientSocket
+  encodedResponse.clientId = request.clientId
+  encodedResponse.buffer1 = encodeHeaders(statusCode, headers)
+  # Don't set closeConnection on the header buffer since more chunks follow
+
+  request.responded = true
+  request.responseStream = stream
+
+  var queueWasEmpty: bool
+  withLock request.server.responseQueueLock:
+    queueWasEmpty = request.server.responseQueue.len == 0
+    request.server.responseQueue.addLast(move encodedResponse)
+
+  if queueWasEmpty:
+    request.server.trigger(request.server.responseQueued)
+
+  result = stream
+
+proc write*(
+  stream: ResponseStream,
+  data: sink string
+) {.raises: [], gcsafe.} =
+  ## Sends a chunk of body data over the streaming response.
+  ## Blocks if the backpressure threshold is exceeded.
+  ## For HTTP/1.1, data is chunk-encoded per RFC 7230 Section 4.1.
+
+  if data.len == 0:
+    return # Empty write is a no-op (0-length chunk = end of body)
+
+  if stream.error.load(moRelaxed):
+    return
+
+  var encodedChunk = OutgoingBuffer()
+  encodedChunk.clientSocket = stream.clientSocket
+  encodedChunk.clientId = stream.clientId
+  encodedChunk.responseStream = stream
+
+  if stream.http10Mode:
+    encodedChunk.buffer1 = move data
+  else:
+    # Chunk encoding: hexLen\r\n + data + \r\n
+    let hexLen = toHexWithoutLeadingZeroes(data.len)
+    encodedChunk.buffer1 = newStringOfCap(hexLen.len + 2 + data.len + 2)
+    encodedChunk.buffer1.add(hexLen)
+    encodedChunk.buffer1.add("\r\n")
+    encodedChunk.buffer1.add(data)
+    encodedChunk.buffer1.add("\r\n")
+
+  let bufferBytes = encodedChunk.buffer1.len + encodedChunk.buffer2.len
+  discard stream.pendingBytes.fetchAdd(bufferBytes)
+
+  var queueWasEmpty: bool
+  withLock stream.server.responseQueueLock:
+    queueWasEmpty = stream.server.responseQueue.len == 0
+    stream.server.responseQueue.addLast(move encodedChunk)
+
+  if queueWasEmpty:
+    stream.server.trigger(stream.server.responseQueued)
+
+  # Backpressure: block if too many bytes pending
+  if stream.pendingBytes.load(moRelaxed) >= stream.maxPendingBytes:
+    withLock stream.lock:
+      while stream.pendingBytes.load(moRelaxed) >= stream.maxPendingBytes and
+          not stream.error.load(moRelaxed):
+        wait(stream.cond, stream.lock)
+
+proc finish*(stream: ResponseStream) {.raises: [], gcsafe.} =
+  ## Sends the terminal chunk and cleans up the stream.
+  ## After this call the ResponseStream must not be used.
+
+  if not stream.finished:
+    stream.finished = true
+
+    if not stream.error.load(moRelaxed):
+      var terminalChunk = OutgoingBuffer()
+      terminalChunk.clientSocket = stream.clientSocket
+      terminalChunk.clientId = stream.clientId
+      terminalChunk.closeConnection = stream.closeConnection
+
+      if stream.http10Mode:
+        # HTTP/1.0: just close the connection (no terminal chunk)
+        terminalChunk.buffer1 = ""
+      else:
+        terminalChunk.buffer1 = "0\r\n\r\n"
+
+      var queueWasEmpty: bool
+      withLock stream.server.responseQueueLock:
+        queueWasEmpty = stream.server.responseQueue.len == 0
+        stream.server.responseQueue.addLast(move terminalChunk)
+
+      if queueWasEmpty:
+        stream.server.trigger(stream.server.responseQueued)
+
+proc destroyResponseStream(stream: ResponseStream) =
+  if stream != nil:
+    deinitLock(stream.lock)
+    deinitCond(stream.cond)
+    `=destroy`(stream[])
+    deallocShared(stream)
+
+proc hasError*(stream: ResponseStream): bool {.raises: [], gcsafe.} =
+  ## Returns true if the connection was closed/errored during streaming.
+  stream.error.load(moRelaxed)
+
+proc isStreaming*(request: Request): bool {.inline.} =
+  ## Returns true if this request has a streaming body.
+  request.requestStream != nil
+
+proc read*(request: Request, maxBytes: int = 65536): string {.gcsafe.} =
+  ## Reads up to maxBytes from the request body stream.
+  ## Returns the data read. Returns "" when the body is complete (EOF).
+  ## Blocks if no data is available yet.
+
+  if request.requestStream == nil:
+    return ""
+
+  let
+    rs = request.requestStream
+    channel = rs.channel
+
+  withLock channel.lock:
+    # Wait until data is available or channel is closed
+    while channel.available == 0 and not channel.closed:
+      wait(channel.cond, channel.lock)
+
+    if channel.available == 0 and channel.closed:
+      return "" # EOF
+
+    let bytesRead = channel.readChannel(result, maxBytes)
+    rs.bytesRead += bytesRead
+
+    # If we were paused and now have free space, signal resume
+    if channel.pausedReading and channel.freeSpace > channel.capacity div 4:
+      channel.pausedReading = false
+      var queueWasEmpty: bool
+      withLock rs.server.streamResumeQueueLock:
+        queueWasEmpty = rs.server.streamResumeQueue.len == 0
+        rs.server.streamResumeQueue.addLast(rs.clientSocket)
+      if queueWasEmpty:
+        rs.server.trigger(rs.server.streamResumeReading)
+
+proc readAll*(request: Request): string {.gcsafe.} =
+  ## Reads the entire remaining request body stream.
+  ## This buffers everything in memory.
+
+  if request.requestStream == nil:
+    return request.body
+
+  while true:
+    let chunk = request.read()
+    if chunk.len == 0:
+      break
+    result.add(chunk)
+
+proc destroyRequestStream(rs: RequestStream) =
+  if rs != nil:
+    destroyStreamChannel(rs.channel)
+    `=destroy`(rs[])
+    deallocShared(rs)
+
 proc upgradeToWebSocket*(
   request: Request
 ): WebSocket {.raises: [MummyError], gcsafe.} =
@@ -456,8 +696,22 @@ proc workerProc(server: Server) {.raises: [].} =
           ErrorLevel,
           "Handler exception: " & e.msg & " " & e.getStackTrace()
         )
-        if not task.request.responded:
+        if task.request.responseStream != nil:
+          # If a streaming response was started, finish it (closes connection)
+          if not task.request.responseStream.finished:
+            task.request.responseStream.closeConnection = true
+            task.request.responseStream.finish()
+        elif not task.request.responded:
           task.request.respond(500)
+      # Clean up streaming resources
+      if task.request.responseStream != nil:
+        if not task.request.responseStream.finished:
+          task.request.responseStream.finish()
+        destroyResponseStream(task.request.responseStream)
+        task.request.responseStream = nil
+      if task.request.requestStream != nil:
+        destroyRequestStream(task.request.requestStream)
+        task.request.requestStream = nil
       `=destroy`(task.request[])
       deallocShared(task.request)
     else: # WebSocket
@@ -751,7 +1005,8 @@ proc popRequest(
   result.queryParams = move dataEntry.requestState.queryParams
   result.headers = move dataEntry.requestState.headers
   result.body = move dataEntry.requestState.body
-  result.body.setLen(dataEntry.requestState.contentLength)
+  if not dataEntry.streamingRequest:
+    result.body.setLen(dataEntry.requestState.contentLength)
   dataEntry.requestState = IncomingRequestState()
   inc dataEntry.requestCounter
   if dataEntry.bytesReceived > 0:
@@ -763,9 +1018,10 @@ proc afterRecvHttp(
   dataEntry: DataEntry
 ): bool {.raises: [].} =
   # We do not expect pipelined requests so log if any new data is received
-  # while a request is outstanding
+  # while a request is outstanding (except when streaming body data)
   if dataEntry.requestCounter > 0 and
-    not dataEntry.requestState.loggedUnexpectedData:
+    not dataEntry.requestState.loggedUnexpectedData and
+    not dataEntry.streamingRequest:
     server.log(
       DebugLevel,
       "Received data before the previous request has been responded to"
@@ -956,9 +1212,157 @@ proc afterRecvHttp(
     # Mark that headers have been parsed, must end this block
     dataEntry.requestState.headersParsed = true
 
+    # Check if this request should be streamed
+    if server.streamingThreshold >= 0 and (
+      dataEntry.requestState.chunked or
+      dataEntry.requestState.contentLength > server.streamingThreshold
+    ):
+      let channel = initStreamChannel()
+      dataEntry.streamChannel = channel
+      dataEntry.streamingRequest = true
+      dataEntry.streamBytesRemaining =
+        dataEntry.requestState.contentLength
+
+      let reqStream = cast[RequestStream](
+        allocShared0(sizeof(RequestStreamObj))
+      )
+      reqStream.server = server
+      reqStream.clientSocket = clientSocket
+      reqStream.clientId = dataEntry.clientId
+      reqStream.channel = channel
+      reqStream.contentLength =
+        if dataEntry.requestState.chunked: -1
+        else: dataEntry.requestState.contentLength
+
+      # Pop the request immediately (with empty body) and dispatch
+      let request = server.popRequest(clientSocket, dataEntry)
+      request.requestStream = reqStream
+      server.postTask(WorkerTask(request: request))
+      # Fall through to push any buffered body data below
+
   # Headers have been parsed, now for the body
 
-  if dataEntry.requestState.chunked: # Chunked request
+  # If this is a streaming request, push body data to the channel
+  if dataEntry.streamingRequest:
+    let channel = dataEntry.streamChannel
+    if dataEntry.requestState.chunked:
+      # Streaming chunked: decode chunks and push decoded data to channel
+      while true:
+        if dataEntry.bytesReceived < 3:
+          return false
+
+        let chunkLenEnd = dataEntry.recvBuf.find(
+          "\r\n",
+          0,
+          min(dataEntry.bytesReceived - 1, 19)
+        )
+        if chunkLenEnd < 0:
+          if dataEntry.bytesReceived > 19:
+            withLock channel.lock:
+              channel.errorChannel()
+              signal(channel.cond)
+            dataEntry.streamingRequest = false
+            return true
+          return false
+
+        var chunkLen: int
+        try:
+          chunkLen =
+            strictParseHex(dataEntry.recvBuf.toOpenArray(0, chunkLenEnd - 1))
+        except Exception as e:
+          withLock channel.lock:
+            channel.errorChannel()
+            signal(channel.cond)
+          dataEntry.streamingRequest = false
+          return true
+
+        let chunkStart = chunkLenEnd + 2
+        if dataEntry.bytesReceived < chunkStart + chunkLen + 2:
+          return false
+
+        if chunkLen == 0:
+          # End of chunked body
+          let nextChunkStart = chunkLenEnd + 2 + chunkLen + 2
+          let bytesRemaining = dataEntry.bytesReceived - nextChunkStart
+          copyMem(
+            dataEntry.recvBuf[0].addr,
+            dataEntry.recvBuf[nextChunkStart].addr,
+            bytesRemaining
+          )
+          dataEntry.bytesReceived = bytesRemaining
+          withLock channel.lock:
+            channel.closeChannel()
+            signal(channel.cond)
+          dataEntry.streamingRequest = false
+          dataEntry.streamChannel = nil
+          return false
+
+        # Push chunk data to channel
+        var written = 0
+        withLock channel.lock:
+          written = channel.writeChannel(
+            dataEntry.recvBuf[chunkStart].addr,
+            chunkLen
+          )
+          if written > 0:
+            signal(channel.cond)
+
+        if written < chunkLen:
+          # Channel is full, pause reading
+          # We can't partially consume a chunk, so we need the full chunk
+          # to fit. Mark as paused and wait.
+          channel.pausedReading = true
+          return false
+
+        # Remove this chunk from the receive buffer
+        let
+          nextChunkStart = chunkLenEnd + 2 + chunkLen + 2
+          bytesRemaining = dataEntry.bytesReceived - nextChunkStart
+        copyMem(
+          dataEntry.recvBuf[0].addr,
+          dataEntry.recvBuf[nextChunkStart].addr,
+          bytesRemaining
+        )
+        dataEntry.bytesReceived = bytesRemaining
+    else:
+      # Streaming Content-Length: push raw bytes to channel
+      if dataEntry.bytesReceived > 0:
+        # Don't push more than the remaining content length
+        let toWrite = min(dataEntry.bytesReceived,
+                          dataEntry.streamBytesRemaining)
+        var written: int
+        if toWrite > 0:
+          withLock channel.lock:
+            written = channel.writeChannel(
+              dataEntry.recvBuf[0].addr,
+              toWrite
+            )
+            if written > 0:
+              signal(channel.cond)
+              dataEntry.streamBytesRemaining -= written
+
+        if written > 0:
+          if written < dataEntry.bytesReceived:
+            copyMem(
+              dataEntry.recvBuf[0].addr,
+              dataEntry.recvBuf[written].addr,
+              dataEntry.bytesReceived - written
+            )
+          dataEntry.bytesReceived -= written
+
+        if toWrite > 0 and written == 0:
+          # Channel is full, pause reading
+          channel.pausedReading = true
+
+        if dataEntry.streamBytesRemaining <= 0:
+          # All body bytes have been delivered
+          withLock channel.lock:
+            channel.closeChannel()
+            signal(channel.cond)
+          dataEntry.streamingRequest = false
+          dataEntry.streamChannel = nil
+      return false
+  elif dataEntry.requestState.chunked: # Chunked request (non-streaming)
     # Process as many chunks as we have
     while true:
       if dataEntry.bytesReceived < 3:
@@ -1082,6 +1486,14 @@ proc afterSend(
     # The current outgoing buffer for this socket has been fully sent
     # Remove it from the outgoing buffer queue
     dataEntry.outgoingBuffers.shrink(fromFirst = 1)
+    # Signal response stream backpressure if applicable
+    if outgoingBuffer.responseStream != nil:
+      let stream = outgoingBuffer.responseStream
+      let prev = stream.pendingBytes.fetchSub(totalBytes)
+      if prev >= stream.maxPendingBytes and
+          prev - totalBytes < stream.maxPendingBytes:
+        withLock stream.lock:
+          signal(stream.cond)
     if outgoingBuffer.isCloseFrame:
       dataEntry.closeFrameSent = true
     if outgoingBuffer.closeConnection:
@@ -1110,6 +1522,7 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     deinitLock(server.responseQueueLock)
     deinitLock(server.sendQueueLock)
     deinitLock(server.websocketQueuesLock)
+    deinitLock(server.streamResumeQueueLock)
     try:
       server.responseQueued.close()
     except Exception as e:
@@ -1120,6 +1533,10 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
       discard # Ignore
     try:
       server.shutdown.close()
+    except Exception as e:
+      discard # Ignore
+    try:
+      server.streamResumeReading.close()
     except Exception as e:
       discard # Ignore
     `=destroy`(server[])
@@ -1146,7 +1563,9 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
     let readyCount = server.selector.selectInto(-1, readyKeys)
 
     # Collapse these events into simple flags
-    var responseQueuedTriggered, sendQueuedTriggered, shutdownTriggered: bool
+    var
+      responseQueuedTriggered, sendQueuedTriggered: bool
+      shutdownTriggered, streamResumeTriggered: bool
     for i in 0 ..< readyCount:
       let readyKey = readyKeys[i]
       if User in readyKey.events:
@@ -1157,6 +1576,8 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           sendQueuedTriggered = true
         elif eventDataEntry.event == server.shutdown:
           shutdownTriggered = true
+        elif eventDataEntry.event == server.streamResumeReading:
+          streamResumeTriggered = true
         else:
           discard
 
@@ -1242,6 +1663,23 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
             server.log(DebugLevel, "Dropped message to disconnected client")
         else:
           server.log(DebugLevel, "Dropped message to disconnected client")
+
+    if streamResumeTriggered:
+      var socketsToResume: seq[SocketHandle]
+      withLock server.streamResumeQueueLock:
+        while server.streamResumeQueue.len > 0:
+          socketsToResume.add(server.streamResumeQueue.popFirst())
+
+      for clientSocket in socketsToResume:
+        if clientSocket in server.selector:
+          let dataEntry = server.selector.getData(clientSocket)
+          if dataEntry.streamChannel != nil and
+              dataEntry.streamChannel.pausedReading:
+            dataEntry.streamChannel.pausedReading = false
+            let events =
+              if dataEntry.outgoingBuffers.len > 0: {Read, Write}
+              else: {Read}
+            server.selector.updateHandle2(clientSocket, events)
 
     if shutdownTriggered:
       server.destroy(true)
@@ -1369,6 +1807,19 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
       finally:
         clientSocket.close()
         server.clientSockets.excl(clientSocket)
+      # Signal error on streaming upload channel
+      if dataEntry.streamChannel != nil:
+        withLock dataEntry.streamChannel.lock:
+          dataEntry.streamChannel.errorChannel()
+          signal(dataEntry.streamChannel.cond)
+        dataEntry.streamingRequest = false
+        dataEntry.streamChannel = nil
+      # Signal error on any active response streams
+      for outgoing in dataEntry.outgoingBuffers:
+        if outgoing.responseStream != nil:
+          outgoing.responseStream.error.store(true, moRelaxed)
+          withLock outgoing.responseStream.lock:
+            signal(outgoing.responseStream.cond)
       if dataEntry.upgradedToWebSocket:
         let websocket = WebSocket(
           server: server,
@@ -1455,7 +1906,8 @@ proc newServer*(
   workerThreads = max(countProcessors() * 10, 1),
   maxHeadersLen = 8 * 1024, # 8 KB
   maxBodyLen = 1024 * 1024, # 1 MB
-  maxMessageLen = 64 * 1024 # 64 KB
+  maxMessageLen = 64 * 1024, # 64 KB
+  streamingThreshold = -1 # Body size above which requests are streamed (-1 = never)
 ): Server {.raises: [MummyError].} =
   ## Creates a new HTTP server. The request handler will be called for incoming
   ## HTTP requests. The WebSocket handler will be called for WebSocket events.
@@ -1463,6 +1915,10 @@ proc newServer*(
   ## WebSocket events are dispatched serially per connection. This means your
   ## WebSocket handler must return from a call before the next call will be
   ## dispatched for the same connection.
+  ## Set streamingThreshold >= 0 to enable streaming request bodies. Requests
+  ## with Content-Length exceeding this value (or chunked requests when threshold
+  ## is >= 0) will have their body streamed via request.read() instead of
+  ## being fully buffered in request.body.
 
   if handler == nil:
     raise newException(MummyError, "The request handler must not be nil")
@@ -1478,6 +1934,7 @@ proc newServer*(
   result.maxHeadersLen = maxHeadersLen
   result.maxBodyLen = maxBodyLen
   result.maxMessageLen = maxMessageLen
+  result.streamingThreshold = streamingThreshold
   result.rand = initRand()
 
   result.workerThreads.setLen(workerThreads)
@@ -1487,6 +1944,7 @@ proc newServer*(
     result.responseQueued = newSelectEvent()
     result.sendQueued = newSelectEvent()
     result.shutdown = newSelectEvent()
+    result.streamResumeReading = newSelectEvent()
 
     result.selector = newSelector[DataEntry]()
 
@@ -1502,11 +1960,16 @@ proc newServer*(
     shutdownData.event = result.shutdown
     result.selector.registerEvent(result.shutdown, shutdownData)
 
+    let streamResumeData = DataEntry(kind: EventEntry)
+    streamResumeData.event = result.streamResumeReading
+    result.selector.registerEvent(result.streamResumeReading, streamResumeData)
+
     initLock(result.taskQueueLock)
     initCond(result.taskQueueCond)
     initLock(result.responseQueueLock)
     initLock(result.sendQueueLock)
     initLock(result.websocketQueuesLock)
+    initLock(result.streamResumeQueueLock)
 
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)
